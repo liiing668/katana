@@ -1,12 +1,15 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/utils/errkit"
 	urlutil "github.com/projectdiscovery/utils/url"
 	"github.com/remeh/sizedwaitgroup"
@@ -41,6 +44,12 @@ func (r *Runner) ExecuteCrawling() error {
 	}
 
 	wg := sizedwaitgroup.New(r.options.Parallelism)
+	// Real output I/O errors (e.g. response archival failures) are
+	// collected so they can be returned once every input has finished
+	// crawling, causing a non-zero CLI exit. Ordinary filtering and
+	// per-target crawl warnings are not fatal.
+	var archiveErrs []error
+	var archiveErrsMu sync.Mutex
 	for _, input := range inputs {
 		if !r.networkpolicy.Validate(input) {
 			gologger.Info().Msgf("Skipping excluded host %s", input)
@@ -55,6 +64,11 @@ func (r *Runner) ExecuteCrawling() error {
 
 			if err := r.crawler.Crawl(input); err != nil {
 				gologger.Warning().Msgf("Could not crawl %s: %s", input, err)
+				if errors.Is(err, output.ErrStoreResponse) {
+					archiveErrsMu.Lock()
+					archiveErrs = append(archiveErrs, err)
+					archiveErrsMu.Unlock()
+				}
 			}
 			r.state.InFlightUrls.Delete(input)
 		}(input)
@@ -64,6 +78,9 @@ func (r *Runner) ExecuteCrawling() error {
 	// Show completion message with stats
 	r.showCompletionStats(startTime)
 
+	if len(archiveErrs) > 0 {
+		return errkit.Combine(archiveErrs...)
+	}
 	return nil
 }
 

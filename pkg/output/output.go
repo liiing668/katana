@@ -56,6 +56,7 @@ type StandardWriter struct {
 	outputMutex           *sync.Mutex
 	storeResponse         bool
 	storeResponseDir      string
+	storeResponseMutex    *sync.Mutex
 	noClobber             bool
 	omitRaw               bool
 	omitBody              bool
@@ -80,6 +81,7 @@ func New(options Options) (Writer, error) {
 		verbose:               options.Verbose,
 		aurora:                aurora.NewAurora(options.Colors),
 		outputMutex:           &sync.Mutex{},
+		storeResponseMutex:    &sync.Mutex{},
 		storeResponse:         options.StoreResponse,
 		storeResponseDir:      options.StoreResponseDir,
 		noClobber:             options.NoClobber,
@@ -218,23 +220,12 @@ func (w *StandardWriter) Write(result *Result) error {
 	var data []byte
 	var err error
 
+	// Archive the response before publishing anything: if any archival
+	// step fails, the result must not be printed, indexed, counted or
+	// delivered to OnResult as a success.
 	if w.storeResponse && result.HasResponse() {
-		if fileName, fileWriter, err := getResponseFile(w.storeResponseDir, result.Response.Resp.Request.URL.String()); err == nil {
-			if absPath, err := filepath.Abs(fileName); err == nil {
-				fileName = absPath
-			}
-			result.Response.StoredResponsePath = fileName
-			data, err := w.formatResult(result)
-			if err != nil {
-				return errkit.Wrap(err, "output: could not store response")
-			}
-			if err := updateIndex(w.storeResponseDir, result); err != nil {
-				return errkit.Wrap(err, "output: could not store response")
-			}
-			if err := fileWriter.Write(data); err != nil {
-				return errkit.Wrap(err, "output: could not store response")
-			}
-			_ = fileWriter.Close()
+		if err := w.archiveResponse(result); err != nil {
+			return err
 		}
 	}
 

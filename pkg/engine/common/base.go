@@ -3,6 +3,7 @@ package common
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math"
 	"math/rand/v2"
@@ -53,6 +54,11 @@ type Shared struct {
 	PathTrie           *utils.PathTrie
 	DomainPageCounter sync.Map
 	hostBackoffs *lru.Cache[string, *hostBackoff]
+	// outputErr records the first real output I/O error (e.g. response
+	// archival failures) observed while crawling, so it can be returned
+	// from Do once in-flight requests have finished.
+	outputErrMu sync.Mutex
+	outputErr   error
 }
 
 // NewShared creates a new Shared instance with the provided crawler options.
@@ -233,9 +239,32 @@ func (s *Shared) Output(navigationRequest *navigation.Request, navigationRespons
 
 	outputErr := s.Options.OutputWriter.Write(result)
 
+	// Real output I/O errors (e.g. response archival failures) are
+	// recorded so the crawl can report them once in-flight work has
+	// finished. Ordinary output filtering is not an error.
+	if outputErr != nil && errors.Is(outputErr, output.ErrStoreResponse) {
+		s.recordOutputError(outputErr)
+	}
+
 	if s.Options.Options.OnResult != nil && outputErr == nil {
 		s.Options.Options.OnResult(*result)
 	}
+}
+
+// recordOutputError stores the first output I/O error encountered.
+func (s *Shared) recordOutputError(err error) {
+	s.outputErrMu.Lock()
+	defer s.outputErrMu.Unlock()
+	if s.outputErr == nil {
+		s.outputErr = err
+	}
+}
+
+// OutputError returns the first output I/O error encountered, if any.
+func (s *Shared) OutputError() error {
+	s.outputErrMu.Lock()
+	defer s.outputErrMu.Unlock()
+	return s.outputErr
 }
 
 var logoutURLPattern = regexp.MustCompile(`(?i)(log[\s_-]?out|sign[\s_-]?out|signout|deconnexion|cerrar[\s_-]?sesion|sair|abmelden|uitloggen|ausloggen|disconnect|terminate|end[\s_-]?session|salir|desconectar|afmelden|wyloguj|sign[\s_-]?off)`)
@@ -543,5 +572,13 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 		}()
 	}
 	wg.Wait()
+	// In-flight requests have finished; surface any output I/O error
+	// (e.g. response archival failure) observed while crawling.
+	if err := s.OutputError(); err != nil {
+		if ctxErr := crawlSession.Ctx.Err(); ctxErr != nil {
+			return errkit.Combine(err, ctxErr)
+		}
+		return err
+	}
 	return crawlSession.Ctx.Err()
 }
